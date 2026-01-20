@@ -1,14 +1,6 @@
 import React, { useState } from 'react';
-import { Download, Youtube, Loader2, Play, AlertCircle } from 'lucide-react';
+import { Download, Youtube, Loader2, Play, AlertCircle, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-
-// Piped API instances for direct calls (with CORS support)
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://pipedapi.in.projectsegfau.lt',
-  'https://api.piped.yt'
-];
 
 function App() {
   const [url, setUrl] = useState('');
@@ -23,7 +15,8 @@ function App() {
   const extractVideoId = (url) => {
     const patterns = [
       /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
-      /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/
+      /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+      /youtube\.com\/live\/([a-zA-Z0-9_-]{11})/
     ];
     for (const pattern of patterns) {
       const match = url.match(pattern);
@@ -54,40 +47,6 @@ function App() {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Fetch video info with fallback instances
-  const fetchVideoInfo = async (videoId) => {
-    // Try local API first (Cloudflare Functions)
-    try {
-      const localRes = await fetch(`/api/info?v=${videoId}`);
-      if (localRes.ok) {
-        return await localRes.json();
-      }
-    } catch (e) {
-      console.log('Local API not available, trying external...');
-    }
-
-    // Fallback to direct Piped API calls
-    for (const instance of PIPED_INSTANCES) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
-        
-        const response = await fetch(`${instance}/streams/${videoId}`, {
-          signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (response.ok) {
-          return await response.json();
-        }
-      } catch (err) {
-        console.log(`Failed with ${instance}, trying next...`);
-      }
-    }
-    throw new Error('All API instances failed');
-  };
-
   const handleFetch = async (e) => {
     e.preventDefault();
     if (!url) return;
@@ -107,69 +66,74 @@ function App() {
     }
 
     try {
-      const data = await fetchVideoInfo(videoId);
+      // Use our Cloudflare Function proxy
+      const response = await fetch(`/api/info?v=${videoId}`);
+      const data = await response.json();
       
       if (data.error) {
         throw new Error(data.error);
       }
 
-      // Get video streams (with audio combined)
+      if (!data.title) {
+        throw new Error('Video not found or unavailable');
+      }
+
+      // Get video streams
       const videoStreams = data.videoStreams || [];
       
-      // Process and filter streams
-      const qualities = videoStreams
-        .filter(stream => {
-          // Prefer streams with audio, or MP4 format
-          return !stream.videoOnly && stream.mimeType?.includes('video');
-        })
+      // Process streams - prefer streams with audio
+      const withAudio = videoStreams
+        .filter(s => !s.videoOnly)
         .map(stream => ({
           url: stream.url,
           quality: stream.quality,
           resolution: parseInt(stream.quality) || 0,
           format: stream.mimeType?.includes('mp4') ? 'MP4' : 'WEBM',
-          mimeType: stream.mimeType,
           size: stream.contentLength,
           fps: stream.fps,
-          codec: stream.codec
+          videoOnly: false
         }))
-        .filter(q => q.resolution > 0)
-        .sort((a, b) => b.resolution - a.resolution);
+        .filter(q => q.resolution > 0);
 
-      // Remove duplicates, keep best for each resolution
+      // Also get video-only streams for higher qualities
+      const videoOnly = videoStreams
+        .filter(s => s.videoOnly)
+        .map(stream => ({
+          url: stream.url,
+          quality: stream.quality,
+          resolution: parseInt(stream.quality) || 0,
+          format: stream.mimeType?.includes('mp4') ? 'MP4' : 'WEBM',
+          size: stream.contentLength,
+          fps: stream.fps,
+          videoOnly: true
+        }))
+        .filter(q => q.resolution > 0);
+
+      // Combine and deduplicate, prefer with audio
+      const allQualities = [...withAudio, ...videoOnly];
       const uniqueQualities = [];
       const seenResolutions = new Set();
-      for (const q of qualities) {
-        if (!seenResolutions.has(q.resolution)) {
-          seenResolutions.add(q.resolution);
-          uniqueQualities.push(q);
-        }
-      }
-
-      // If no combined streams, try video-only streams
-      if (uniqueQualities.length === 0) {
-        const videoOnlyStreams = videoStreams
-          .filter(stream => stream.videoOnly && stream.mimeType?.includes('video'))
-          .map(stream => ({
-            url: stream.url,
-            quality: stream.quality,
-            resolution: parseInt(stream.quality) || 0,
-            format: stream.mimeType?.includes('mp4') ? 'MP4' : 'WEBM',
-            mimeType: stream.mimeType,
-            size: stream.contentLength,
-            fps: stream.fps,
-            codec: stream.codec,
-            videoOnly: true
-          }))
-          .filter(q => q.resolution > 0)
-          .sort((a, b) => b.resolution - a.resolution);
-
-        for (const q of videoOnlyStreams) {
-          if (!seenResolutions.has(q.resolution)) {
-            seenResolutions.add(q.resolution);
+      
+      // Sort by resolution descending
+      allQualities.sort((a, b) => b.resolution - a.resolution);
+      
+      for (const q of allQualities) {
+        const key = `${q.resolution}-${q.videoOnly}`;
+        if (!seenResolutions.has(q.resolution) || (seenResolutions.has(q.resolution) && !q.videoOnly)) {
+          // Remove existing video-only if we found one with audio
+          const existingIdx = uniqueQualities.findIndex(uq => uq.resolution === q.resolution && uq.videoOnly && !q.videoOnly);
+          if (existingIdx >= 0) {
+            uniqueQualities.splice(existingIdx, 1);
+          }
+          if (!uniqueQualities.find(uq => uq.resolution === q.resolution)) {
             uniqueQualities.push(q);
+            seenResolutions.add(q.resolution);
           }
         }
       }
+
+      // Sort again
+      uniqueQualities.sort((a, b) => b.resolution - a.resolution);
 
       if (uniqueQualities.length === 0) {
         throw new Error('No downloadable formats found for this video');
@@ -200,10 +164,18 @@ function App() {
     
     setDownloading(true);
     
-    // Open stream URL in new tab (triggers download)
+    // Open stream URL in new tab
     window.open(selectedQuality.url, '_blank');
     
     setTimeout(() => setDownloading(false), 2000);
+  };
+
+  const getQualityLabel = (resolution) => {
+    if (resolution >= 2160) return '4K';
+    if (resolution >= 1440) return '2K';
+    if (resolution >= 1080) return 'FHD';
+    if (resolution >= 720) return 'HD';
+    return 'SD';
   };
 
   return (
@@ -243,7 +215,14 @@ function App() {
             disabled={loading}
             className="bg-red-600 hover:bg-red-700 disabled:bg-zinc-800 text-white px-8 py-4 rounded-xl font-bold transition-all flex items-center justify-center gap-2"
           >
-            {loading ? <Loader2 className="animate-spin" size={20} /> : 'Fetch'}
+            {loading ? (
+              <>
+                <Loader2 className="animate-spin" size={20} />
+                Fetching...
+              </>
+            ) : (
+              'Fetch'
+            )}
           </button>
         </form>
       </motion.div>
@@ -254,10 +233,19 @@ function App() {
             initial={{ opacity: 0 }} 
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="flex items-center justify-center gap-2 text-red-500 text-center mb-4 bg-red-500/10 border border-red-500/20 rounded-xl p-4"
+            className="flex flex-col items-center gap-3 text-center mb-6"
           >
-            <AlertCircle size={20} />
-            {error}
+            <div className="flex items-center gap-2 text-red-500 bg-red-500/10 border border-red-500/20 rounded-xl p-4 w-full">
+              <AlertCircle size={20} />
+              {error}
+            </div>
+            <button 
+              onClick={handleFetch}
+              className="flex items-center gap-2 text-zinc-400 hover:text-white transition-colors"
+            >
+              <RefreshCw size={16} />
+              Try again
+            </button>
           </motion.div>
         )}
 
@@ -304,23 +292,27 @@ function App() {
                               : 'bg-zinc-800/50 border-zinc-700 hover:border-zinc-500'
                           }`}
                         >
-                          <div className="font-bold text-sm flex items-center gap-1">
-                            {quality.resolution}p
-                            {quality.resolution >= 2160 && <span className="text-xs opacity-70">4K</span>}
-                            {quality.resolution === 1440 && <span className="text-xs opacity-70">2K</span>}
-                            {quality.videoOnly && <span className="text-xs text-yellow-500">*</span>}
+                          <div className="font-bold text-sm flex items-center gap-2">
+                            <span>{quality.resolution}p</span>
+                            <span className={`text-xs px-1.5 py-0.5 rounded ${
+                              selectedQuality?.resolution === quality.resolution
+                                ? 'bg-white/20'
+                                : 'bg-zinc-700'
+                            }`}>
+                              {getQualityLabel(quality.resolution)}
+                            </span>
                           </div>
                           <div className="text-xs opacity-60 mt-1">
                             {quality.format}
                             {quality.fps && ` • ${quality.fps}fps`}
                             {quality.size && ` • ${formatSize(quality.size)}`}
                           </div>
+                          {quality.videoOnly && (
+                            <div className="text-xs text-yellow-500 mt-1">No audio</div>
+                          )}
                         </button>
                       ))}
                     </div>
-                    {availableQualities.some(q => q.videoOnly) && (
-                      <p className="text-xs text-zinc-500 mt-2">* Video only (no audio)</p>
-                    )}
                   </div>
                 </div>
 
