@@ -2,13 +2,22 @@ import React, { useState } from 'react';
 import { Download, Youtube, Loader2, Play, AlertCircle, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+// Quality options for user selection
+const QUALITY_OPTIONS = [
+  { value: '2160', label: '4K', tag: 'Ultra HD' },
+  { value: '1440', label: '1440p', tag: '2K' },
+  { value: '1080', label: '1080p', tag: 'Full HD' },
+  { value: '720', label: '720p', tag: 'HD' },
+  { value: '480', label: '480p', tag: 'SD' },
+  { value: '360', label: '360p', tag: 'Low' }
+];
+
 function App() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [videoInfo, setVideoInfo] = useState(null);
-  const [availableQualities, setAvailableQualities] = useState([]);
-  const [selectedQuality, setSelectedQuality] = useState(null);
+  const [selectedQuality, setSelectedQuality] = useState('1080');
   const [error, setError] = useState('');
 
   // Extract video ID from YouTube URL
@@ -23,16 +32,6 @@ function App() {
       if (match) return match[1];
     }
     return null;
-  };
-
-  // Format file size
-  const formatSize = (bytes) => {
-    if (!bytes) return '';
-    const mb = bytes / (1024 * 1024);
-    if (mb >= 1024) {
-      return `${(mb / 1024).toFixed(1)} GB`;
-    }
-    return `${mb.toFixed(1)} MB`;
   };
 
   // Format duration
@@ -54,8 +53,6 @@ function App() {
     setLoading(true);
     setError('');
     setVideoInfo(null);
-    setAvailableQualities([]);
-    setSelectedQuality(null);
 
     const videoId = extractVideoId(url);
     
@@ -66,7 +63,6 @@ function App() {
     }
 
     try {
-      // Use our Cloudflare Function proxy
       const response = await fetch(`/api/info?v=${videoId}`);
       const data = await response.json();
       
@@ -74,82 +70,14 @@ function App() {
         throw new Error(data.error);
       }
 
-      if (!data.title) {
-        throw new Error('Video not found or unavailable');
-      }
-
-      // Get video streams
-      const videoStreams = data.videoStreams || [];
-      
-      // Process streams - prefer streams with audio
-      const withAudio = videoStreams
-        .filter(s => !s.videoOnly)
-        .map(stream => ({
-          url: stream.url,
-          quality: stream.quality,
-          resolution: parseInt(stream.quality) || 0,
-          format: stream.mimeType?.includes('mp4') ? 'MP4' : 'WEBM',
-          size: stream.contentLength,
-          fps: stream.fps,
-          videoOnly: false
-        }))
-        .filter(q => q.resolution > 0);
-
-      // Also get video-only streams for higher qualities
-      const videoOnly = videoStreams
-        .filter(s => s.videoOnly)
-        .map(stream => ({
-          url: stream.url,
-          quality: stream.quality,
-          resolution: parseInt(stream.quality) || 0,
-          format: stream.mimeType?.includes('mp4') ? 'MP4' : 'WEBM',
-          size: stream.contentLength,
-          fps: stream.fps,
-          videoOnly: true
-        }))
-        .filter(q => q.resolution > 0);
-
-      // Combine and deduplicate, prefer with audio
-      const allQualities = [...withAudio, ...videoOnly];
-      const uniqueQualities = [];
-      const seenResolutions = new Set();
-      
-      // Sort by resolution descending
-      allQualities.sort((a, b) => b.resolution - a.resolution);
-      
-      for (const q of allQualities) {
-        const key = `${q.resolution}-${q.videoOnly}`;
-        if (!seenResolutions.has(q.resolution) || (seenResolutions.has(q.resolution) && !q.videoOnly)) {
-          // Remove existing video-only if we found one with audio
-          const existingIdx = uniqueQualities.findIndex(uq => uq.resolution === q.resolution && uq.videoOnly && !q.videoOnly);
-          if (existingIdx >= 0) {
-            uniqueQualities.splice(existingIdx, 1);
-          }
-          if (!uniqueQualities.find(uq => uq.resolution === q.resolution)) {
-            uniqueQualities.push(q);
-            seenResolutions.add(q.resolution);
-          }
-        }
-      }
-
-      // Sort again
-      uniqueQualities.sort((a, b) => b.resolution - a.resolution);
-
-      if (uniqueQualities.length === 0) {
-        throw new Error('No downloadable formats found for this video');
-      }
-
       setVideoInfo({
         id: videoId,
         title: data.title,
         thumbnail: data.thumbnailUrl,
         author: data.uploader,
-        duration: data.duration,
-        views: data.views
+        cobaltData: data.cobaltData,
+        fallback: data.fallback
       });
-
-      setAvailableQualities(uniqueQualities);
-      setSelectedQuality(uniqueQualities[0]);
 
     } catch (err) {
       console.error(err);
@@ -159,23 +87,47 @@ function App() {
     }
   };
 
-  const handleDownload = () => {
-    if (!selectedQuality || !videoInfo) return;
+  const handleDownload = async () => {
+    if (!videoInfo) return;
     
     setDownloading(true);
-    
-    // Open stream URL in new tab
-    window.open(selectedQuality.url, '_blank');
-    
-    setTimeout(() => setDownloading(false), 2000);
-  };
+    setError('');
 
-  const getQualityLabel = (resolution) => {
-    if (resolution >= 2160) return '4K';
-    if (resolution >= 1440) return '2K';
-    if (resolution >= 1080) return 'FHD';
-    if (resolution >= 720) return 'HD';
-    return 'SD';
+    try {
+      // If we have cobalt data with direct URL
+      if (videoInfo.cobaltData?.url) {
+        window.open(videoInfo.cobaltData.url, '_blank');
+        setDownloading(false);
+        return;
+      }
+
+      // Otherwise use cobalt API directly with selected quality
+      const response = await fetch('/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoId: videoInfo.id,
+          quality: selectedQuality
+        })
+      });
+
+      const data = await response.json();
+
+      if (data.url) {
+        window.open(data.url, '_blank');
+      } else if (data.fallbackUrl) {
+        window.open(data.fallbackUrl, '_blank');
+      } else {
+        throw new Error(data.error || 'Download failed');
+      }
+
+    } catch (err) {
+      // Fallback to external service
+      const fallbackUrl = `https://ssyoutube.com/watch?v=${videoInfo.id}`;
+      window.open(fallbackUrl, '_blank');
+    } finally {
+      setDownloading(false);
+    }
   };
 
   return (
@@ -193,7 +145,7 @@ function App() {
         <h1 className="text-4xl md:text-6xl font-bold mb-4 tracking-tight">
           Vibe<span className="text-red-500">Loader</span>
         </h1>
-        <p className="text-zinc-400 text-lg">Download YouTube videos in the best available quality.</p>
+        <p className="text-zinc-400 text-lg">Download YouTube videos in high quality.</p>
       </motion.div>
 
       <motion.div 
@@ -262,15 +214,13 @@ function App() {
                   src={videoInfo.thumbnail} 
                   alt="Thumbnail" 
                   className="w-full h-full object-cover"
+                  onError={(e) => {
+                    e.target.src = `https://img.youtube.com/vi/${videoInfo.id}/hqdefault.jpg`;
+                  }}
                 />
                 <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
                   <Play size={48} className="text-white opacity-80" />
                 </div>
-                {videoInfo.duration > 0 && (
-                  <div className="absolute bottom-2 right-2 bg-black/80 px-2 py-1 rounded text-sm font-mono">
-                    {formatDuration(videoInfo.duration)}
-                  </div>
-                )}
               </div>
               <div className="p-6 md:p-8 md:w-3/5 flex flex-col justify-between">
                 <div>
@@ -279,37 +229,21 @@ function App() {
                   
                   <div className="mb-6">
                     <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-3 block">
-                      Available Qualities ({availableQualities.length})
+                      Select Quality
                     </label>
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                      {availableQualities.map((quality, index) => (
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                      {QUALITY_OPTIONS.map((quality) => (
                         <button
-                          key={index}
-                          onClick={() => setSelectedQuality(quality)}
-                          className={`p-3 rounded-xl border text-left transition-all ${
-                            selectedQuality?.resolution === quality.resolution
+                          key={quality.value}
+                          onClick={() => setSelectedQuality(quality.value)}
+                          className={`p-3 rounded-xl border text-center transition-all ${
+                            selectedQuality === quality.value
                               ? 'bg-red-600 border-red-500 text-white'
                               : 'bg-zinc-800/50 border-zinc-700 hover:border-zinc-500'
                           }`}
                         >
-                          <div className="font-bold text-sm flex items-center gap-2">
-                            <span>{quality.resolution}p</span>
-                            <span className={`text-xs px-1.5 py-0.5 rounded ${
-                              selectedQuality?.resolution === quality.resolution
-                                ? 'bg-white/20'
-                                : 'bg-zinc-700'
-                            }`}>
-                              {getQualityLabel(quality.resolution)}
-                            </span>
-                          </div>
-                          <div className="text-xs opacity-60 mt-1">
-                            {quality.format}
-                            {quality.fps && ` • ${quality.fps}fps`}
-                            {quality.size && ` • ${formatSize(quality.size)}`}
-                          </div>
-                          {quality.videoOnly && (
-                            <div className="text-xs text-yellow-500 mt-1">No audio</div>
-                          )}
+                          <div className="font-bold text-sm">{quality.label}</div>
+                          <div className="text-xs opacity-60">{quality.tag}</div>
                         </button>
                       ))}
                     </div>
@@ -318,18 +252,18 @@ function App() {
 
                 <button 
                   onClick={handleDownload}
-                  disabled={downloading || !selectedQuality}
+                  disabled={downloading}
                   className="w-full bg-white text-black hover:bg-zinc-200 disabled:bg-zinc-700 disabled:text-zinc-500 py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-3 transition-colors"
                 >
                   {downloading ? (
                     <>
                       <Loader2 className="animate-spin" size={24} />
-                      Starting Download...
+                      Processing...
                     </>
                   ) : (
                     <>
                       <Download size={24} />
-                      Download {selectedQuality?.resolution}p {selectedQuality?.format}
+                      Download {QUALITY_OPTIONS.find(q => q.value === selectedQuality)?.label} MP4
                     </>
                   )}
                 </button>
