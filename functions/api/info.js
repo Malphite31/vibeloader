@@ -1,8 +1,11 @@
-// Cloudflare Function using Cobalt API (more reliable)
-const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://cobalt-api.hyper.lol',
-  'https://cobalt.api.timelessnesses.me'
+// Cloudflare Function using Invidious API (most reliable)
+const INVIDIOUS_INSTANCES = [
+  'https://invidious.nerdvpn.de',
+  'https://invidious.private.coffee',
+  'https://invidious.protokolla.fi',
+  'https://invidious.perennialte.ch',
+  'https://yt.artemislena.eu',
+  'https://invidious.privacyredirect.com'
 ];
 
 export async function onRequestGet(context) {
@@ -11,41 +14,28 @@ export async function onRequestGet(context) {
 
   const headers = {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Origin': '*'
   };
 
   if (!videoId) {
     return new Response(JSON.stringify({ error: 'Video ID is required' }), { 
-      status: 400,
-      headers
+      status: 400, headers 
     });
   }
 
-  const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
   let lastError = null;
 
-  for (const instance of COBALT_INSTANCES) {
+  for (const instance of INVIDIOUS_INSTANCES) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-      const response = await fetch(`${instance}/api/json`, {
-        method: 'POST',
+      const response = await fetch(`${instance}/api/v1/videos/${videoId}`, {
         signal: controller.signal,
         headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        body: JSON.stringify({
-          url: youtubeUrl,
-          vCodec: 'h264',
-          vQuality: 'max',
-          filenamePattern: 'basic',
-          isAudioOnly: false
-        })
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json'
+        }
       });
 
       clearTimeout(timeoutId);
@@ -53,50 +43,59 @@ export async function onRequestGet(context) {
       if (response.ok) {
         const data = await response.json();
         
-        // Get video metadata from YouTube oEmbed
-        const oembedRes = await fetch(`https://www.youtube.com/oembed?url=${youtubeUrl}&format=json`);
-        let meta = { title: 'YouTube Video', author_name: 'Unknown' };
-        if (oembedRes.ok) {
-          meta = await oembedRes.json();
-        }
+        // Process format streams
+        const formatStreams = (data.formatStreams || []).map(s => ({
+          url: s.url,
+          quality: s.quality,
+          qualityLabel: s.qualityLabel,
+          resolution: parseInt(s.qualityLabel) || parseInt(s.quality) || 0,
+          type: s.type,
+          container: s.container || 'mp4',
+          size: s.size || null,
+          hasAudio: true
+        }));
+
+        // Process adaptive formats (video only - higher quality)
+        const adaptiveFormats = (data.adaptiveFormats || [])
+          .filter(s => s.type?.startsWith('video/'))
+          .map(s => ({
+            url: s.url,
+            quality: s.quality,
+            qualityLabel: s.qualityLabel,
+            resolution: parseInt(s.qualityLabel) || parseInt(s.quality) || 0,
+            type: s.type,
+            container: s.container || (s.type?.includes('webm') ? 'webm' : 'mp4'),
+            size: s.clen || s.contentLength || null,
+            fps: s.fps,
+            hasAudio: false
+          }));
 
         return new Response(JSON.stringify({
           success: true,
-          title: meta.title,
-          uploader: meta.author_name,
-          thumbnailUrl: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
-          cobaltData: data
+          title: data.title,
+          author: data.author,
+          authorId: data.authorId,
+          lengthSeconds: data.lengthSeconds,
+          viewCount: data.viewCount,
+          thumbnail: data.videoThumbnails?.[0]?.url || `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+          formatStreams: formatStreams,
+          adaptiveFormats: adaptiveFormats,
+          instance: instance
         }), { headers });
       }
-      
+
       lastError = `${instance}: HTTP ${response.status}`;
     } catch (err) {
       lastError = `${instance}: ${err.message}`;
+      console.log(lastError);
     }
   }
 
-  // Fallback: Return basic info with direct link instructions
-  try {
-    const oembedRes = await fetch(`https://www.youtube.com/oembed?url=${youtubeUrl}&format=json`);
-    if (oembedRes.ok) {
-      const meta = await oembedRes.json();
-      return new Response(JSON.stringify({
-        success: true,
-        fallback: true,
-        title: meta.title,
-        uploader: meta.author_name,
-        thumbnailUrl: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
-        videoId: videoId
-      }), { headers });
-    }
-  } catch (e) {}
-
   return new Response(JSON.stringify({ 
-    error: 'Could not fetch video info. Please try again.',
+    error: 'All instances are currently unavailable. Please try again in a moment.',
     details: lastError
   }), { 
-    status: 502,
-    headers
+    status: 502, headers 
   });
 }
 
@@ -104,7 +103,7 @@ export async function onRequestOptions() {
   return new Response(null, {
     headers: {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type'
     }
   });
